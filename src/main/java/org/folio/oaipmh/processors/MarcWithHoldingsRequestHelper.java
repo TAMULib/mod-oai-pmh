@@ -345,11 +345,8 @@ public class MarcWithHoldingsRequestHelper extends AbstractGetRecordsHelper {
         downloadInstancesPromise.complete();
       }
     });
-    jsonParser.exceptionHandler(throwable -> responseChecked.future().onSuccess(invalidResponseReceivedAndProcessed -> {
-        if (invalidResponseReceivedAndProcessed) {
-          return;
-        }
-        logger.error("Error has been occurred at JsonParser while saving instances. Message: {}", throwable.getMessage(),
+    jsonParser.exceptionHandler(throwable -> {
+      logger.error("Error has been occurred at JsonParser while reading data from response while setting up batch http stream. Message: {}", throwable.getMessage(),
           throwable);
         downloadInstancesPromise.complete(throwable);
         promise.fail(throwable);
@@ -378,7 +375,7 @@ public class MarcWithHoldingsRequestHelper extends AbstractGetRecordsHelper {
         }
       })
       .onFailure(throwable -> {
-        logger.error("Error has been occurred at JsonParser while reading data from response. Message: {}", throwable.getMessage(),
+        logger.error("Error has been occurred on failure of inventory http request. Message: {}", throwable.getMessage(),
           throwable);
         promise.fail(throwable);
       });
@@ -499,8 +496,119 @@ public class MarcWithHoldingsRequestHelper extends AbstractGetRecordsHelper {
     };
   }
 
-  private Future<Response> buildRecordsResponse(Request request, String requestId, List<JsonObject> batch, OffsetDateTime lastUpdateDate,
-      Map<String, JsonObject> srsResponse, boolean firstBatch, String nextInstanceId, boolean deletedRecordSupport, StatisticsHolder statistics) {
+  private Future<List<JsonObject>> enrichInstances(List<JsonObject> result, Request request) {
+    Map<String, JsonObject> instances = result.stream()
+      .collect(LinkedHashMap::new, (map, instance) -> map.put(instance.getString(INSTANCE_ID_FIELD_NAME), instance), Map::putAll);
+    Promise<List<JsonObject>> completePromise = Promise.promise();
+    var webClient = WebClientProvider.getWebClient();
+    var httpRequest = webClient.postAbs(request.getOkapiUrl() + INVENTORY_ITEMS_AND_HOLDINGS_ENDPOINT);
+    if (request.getOkapiUrl()
+      .contains("https:")) {
+      httpRequest.ssl(true);
+    }
+    httpRequest.putHeader(OKAPI_TOKEN, request.getOkapiToken());
+    httpRequest.putHeader(OKAPI_TENANT, TenantTool.tenantId(request.getOkapiHeaders()));
+    httpRequest.putHeader(ACCEPT, APPLICATION_JSON);
+    httpRequest.putHeader(CONTENT_TYPE, APPLICATION_JSON);
+
+    JsonObject entries = new JsonObject();
+    entries.put(INSTANCE_IDS_ENRICH_PARAM_NAME, new JsonArray(new ArrayList<>(instances.keySet())));
+    entries.put(SKIP_SUPPRESSED_FROM_DISCOVERY_RECORDS, isSkipSuppressed(request));
+
+    var jsonParser = JsonParser.newParser()
+      .objectValueMode();
+    jsonParser.handler(event -> {
+      JsonObject itemsAndHoldingsFields = event.objectValue();
+      String instanceId = itemsAndHoldingsFields.getString(INSTANCE_ID_FIELD_NAME);
+      JsonObject instance = instances.get(instanceId);
+      if (instance != null) {
+        enrichDiscoverySuppressed(itemsAndHoldingsFields, instance);
+        instance.put(RecordMetadataManager.ITEMS_AND_HOLDINGS_FIELDS, itemsAndHoldingsFields);
+        // case when no items
+        if (itemsAndHoldingsFields.getJsonArray(ITEMS)
+          .isEmpty()) {
+          enrichOnlyEffectiveLocationEffectiveCallNumberFromHoldings(instance);
+        } else {
+          adjustItems(instance);
+        }
+      } else {
+        logger.info("Instance with instanceId {} wasn't in the request.", instanceId);
+      }
+    });
+    jsonParser.exceptionHandler(throwable -> {
+      logger.error("Error has been occurred at JsonParser while reading data from response while enriching instances. Message:{}", throwable.getMessage(),
+          throwable);
+      completePromise.fail(throwable);
+    });
+
+    httpRequest.as(BodyCodec.jsonStream(jsonParser))
+      .sendBuffer(entries.toBuffer())
+      .onSuccess(httpResponse -> {
+        logger.info("Response for items and holdings {}: {}", httpResponse.statusCode(), httpResponse.statusMessage());
+        if (httpResponse.statusCode() != 200) {
+          String errorFromStorageMessage = getErrorFromStorageMessage("inventory-storage",
+              request.getOkapiUrl() + INVENTORY_ITEMS_AND_HOLDINGS_ENDPOINT, httpResponse.statusMessage());
+          String errorMessage = errorFromStorageMessage + httpResponse.statusCode();
+          logger.error(errorMessage);
+          completePromise.fail(new IllegalStateException(errorFromStorageMessage));
+        }
+        completePromise.complete(new ArrayList<>(instances.values()));
+      })
+      .onFailure(e -> {
+        logger.error(e.getMessage());
+        completePromise.fail(e);
+      });
+    return completePromise.future();
+  }
+
+  private void enrichDiscoverySuppressed(JsonObject itemsandholdingsfields, JsonObject instance) {
+    if (Boolean.parseBoolean(instance.getString("suppressFromDiscovery")))
+      for (Object item : itemsandholdingsfields.getJsonArray("items")) {
+        if (item instanceof JsonObject) {
+          JsonObject itemJson = (JsonObject) item;
+          itemJson.put(RecordMetadataManager.INVENTORY_SUPPRESS_DISCOVERY_FIELD, true);
+        }
+      }
+  }
+
+  private void enrichOnlyEffectiveLocationEffectiveCallNumberFromHoldings(JsonObject instance) {
+    JsonArray holdingsJson = instance.getJsonObject(ITEMS_AND_HOLDINGS_FIELDS)
+      .getJsonArray(HOLDINGS);
+    JsonArray itemsJson = instance.getJsonObject(ITEMS_AND_HOLDINGS_FIELDS)
+      .getJsonArray(ITEMS);
+    for (Object holding : holdingsJson) {
+      if (holding instanceof JsonObject) {
+        JsonObject holdingJson = (JsonObject) holding;
+        JsonObject callNumberJson = holdingJson.getJsonObject(CALL_NUMBER);
+        JsonObject locationJson = holdingJson.getJsonObject(LOCATION);
+        JsonObject effectiveLocationJson = locationJson.getJsonObject(EFFECTIVE_LOCATION);
+        JsonObject itemJson = new JsonObject();
+        itemJson.put(CALL_NUMBER, callNumberJson);
+        JsonObject locationItemJson = new JsonObject();
+        locationItemJson.put(NAME, effectiveLocationJson.getString(NAME));
+        effectiveLocationJson.remove(NAME);
+        locationItemJson.put(LOCATION, effectiveLocationJson);
+        itemJson.put(LOCATION, locationItemJson);
+        itemsJson.add(itemJson);
+      }
+    }
+  }
+
+  private void adjustItems(JsonObject instance) {
+    JsonArray itemsJson = instance.getJsonObject(ITEMS_AND_HOLDINGS_FIELDS)
+      .getJsonArray(ITEMS);
+    for (Object item: itemsJson) {
+      JsonObject itemJson = (JsonObject) item;
+      itemJson.getJsonObject(LOCATION).put(NAME, itemJson.getJsonObject(LOCATION).getJsonObject(LOCATION).getString(NAME));
+      itemJson.getJsonObject(LOCATION).getJsonObject(LOCATION).remove(NAME);
+      itemJson.getJsonObject(LOCATION).getJsonObject(LOCATION).remove(CODE);
+      itemJson.getJsonObject(LOCATION).remove(TEMPORARY_LOCATION);
+      itemJson.getJsonObject(LOCATION).remove(PERMANENT_LOCATION);
+    }
+  }
+
+  private Future<Response> buildRecordsResponse(Request request, String requestId, List<JsonObject> batch,
+      Map<String, JsonObject> srsResponse, boolean firstBatch, String nextInstanceId, boolean deletedRecordSupport) {
 
     Promise<Response> promise = Promise.promise();
     // Set incoming instances number
@@ -627,7 +735,7 @@ public class MarcWithHoldingsRequestHelper extends AbstractGetRecordsHelper {
     batchesSizeCounter.setRelease(0);
   }
 
-  private Future<Void> saveInstancesIds(List<JsonEvent> instances, String tenant, String requestId,
+  private Promise<Void> saveInstancesIds(List<JsonEvent> instances, String tenant, String requestId,
                                          PostgresClient postgresClient) {
     Promise<Void> promise = Promise.promise();
     List<Instances> instancesList = toInstancesList(instances, UUID.fromString(requestId));

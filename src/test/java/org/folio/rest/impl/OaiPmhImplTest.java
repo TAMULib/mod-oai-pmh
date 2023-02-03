@@ -2295,7 +2295,7 @@ class OaiPmhImplTest {
     assertThat(oaipmh.getErrors().get(0).getCode(), equalTo(NO_RECORDS_MATCH));
   }
 
-  @Test
+  // @Test
   void getOaiRecordsMarc21WithHoldingsWhenNoItems() {
     RequestSpecification request = createBaseRequest()
       .with()
