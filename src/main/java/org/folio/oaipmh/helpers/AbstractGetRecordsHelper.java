@@ -76,6 +76,7 @@ public abstract class AbstractGetRecordsHelper extends AbstractHelper {
   private static final String INSTANCE_IDS_ENRICH_PARAM_NAME = "instanceIds";
   private static final String TEMPORARY_LOCATION = "temporaryLocation";
   private static final String PERMANENT_LOCATION = "permanentLocation";
+  private static final String HOLDINGS_STATEMENTS = "holdingsStatements";
   private static final String EFFECTIVE_LOCATION = "effectiveLocation";
   private static final String CODE = "code";
 
