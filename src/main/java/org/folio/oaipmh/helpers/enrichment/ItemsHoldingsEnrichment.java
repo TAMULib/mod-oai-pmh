@@ -29,6 +29,7 @@ public class ItemsHoldingsEnrichment {
   private static final String EFFECTIVE_LOCATION = "effectiveLocation";
   private static final String CODE = "code";
   private static final String HOLDINGS_RECORD_ID = "holdingsRecordId";
+  private static final String HOLDINGS_STATEMENTS = "holdingsStatements";
   private static final String ID = "id";
   private static final String COPY_NUMBER = "copyNumber";
 
