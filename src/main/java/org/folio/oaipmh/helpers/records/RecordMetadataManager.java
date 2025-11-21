@@ -38,6 +38,7 @@ import io.vertx.core.json.JsonObject;
 public class RecordMetadataManager {
 
   private static final String GENERAL_INFO_FIELD_TAG_NUMBER = "999";
+  private static final String HOLDINGS_RECORD_FIELD_TAG_NUMBER = "998";
   private static final String ELECTRONIC_ACCESS_FILED_TAG_NUMBER = "856";
   private static final String EFFECTIVE_LOCATION_FILED_TAG_NUMBER = "952";
 
@@ -50,6 +51,8 @@ public class RecordMetadataManager {
 
   private static final int FIRST_INDICATOR_INDEX = 0;
   private static final int SECOND_INDICATOR_INDEX = 1;
+  private static final String PERMANENT_LOCATION = "permanentLocation";
+  private static final String HOLDINGS_STATEMENTS = "holdingsStatements";
   private static final String LOCATION = "location";
 
   private static final String DEFAULT_INDICATORS = "4, ";
@@ -204,9 +207,10 @@ public class RecordMetadataManager {
 
     if (nonNull(holdings) && CollectionUtils.isNotEmpty(holdings.getList())) {
       List<Object> fieldsList = getFieldsForUpdate(srsInstance);
-      holdings.forEach(holding ->
-        updateFieldsWithElectronicAccessField((JsonObject) holding, fieldsList, suppressedRecordsProcessing)
-      );
+      holdings.forEach(holding -> {
+        updateFieldsWithElectronicAccessField((JsonObject) holding, fieldsList, suppressedRecordsProcessing);
+        updateFieldsWithHoldingsRecordField((JsonObject) holding, fieldsList, suppressedRecordsProcessing);
+      });
     }
     return srsInstance;
   }
@@ -236,19 +240,22 @@ public class RecordMetadataManager {
                                                           boolean suppressedRecordsProcessing,
                                                           Optional<String> illPolicy) {
     Map<String, Object> effectiveLocationSubFields = constructEffectiveLocationSubFieldsMap(itemData);
+    int suppressedFieldValue = calculateDiscoverySuppressedSubfieldValue(itemData);
     if (suppressedRecordsProcessing) {
-      effectiveLocationSubFields.put(DISCOVERY_SUPPRESSED_SUBFIELD_CODE, calculateDiscoverySuppressedSubfieldValue(itemData));
+      effectiveLocationSubFields.put(DISCOVERY_SUPPRESSED_SUBFIELD_CODE, suppressedFieldValue);
     }
     if (illPolicy.isPresent()) {
       effectiveLocationSubFields.put(ILL_POLICY_SUBFIELD_CODE, illPolicy.get());
     }
-    FieldBuilder fieldBuilder = new FieldBuilder();
-    Map<String, Object> effectiveLocationField = fieldBuilder.withFieldTagNumber(EFFECTIVE_LOCATION_FILED_TAG_NUMBER)
-      .withFirstIndicator(INDICATOR_VALUE)
-      .withSecondIndicator(INDICATOR_VALUE)
-      .withSubFields(effectiveLocationSubFields)
-      .build();
-    marcRecordFields.add(effectiveLocationField);
+    if (suppressedFieldValue == 0) {
+      FieldBuilder fieldBuilder = new FieldBuilder();
+      Map<String, Object> effectiveLocationField = fieldBuilder.withFieldTagNumber(EFFECTIVE_LOCATION_FILED_TAG_NUMBER)
+        .withFirstIndicator(INDICATOR_VALUE)
+        .withSecondIndicator(INDICATOR_VALUE)
+        .withSubFields(effectiveLocationSubFields)
+        .build();
+      marcRecordFields.add(effectiveLocationField);
+    }
   }
 
   /**
@@ -297,6 +304,69 @@ public class RecordMetadataManager {
           }
         }
       });
+    }
+  }
+
+  /**
+   * Constructs field with subfields which are built from holdings record data.
+   *
+   * Constructed field has tag number = 999 and both indicators have a ' ' value.
+   *
+   * @param jsonData                    Json of single item or holding.
+   * @param marcRecordFields            Fields list to be updated with new one.
+   * @param suppressedRecordsProcessing Include suppressed flag in 999 field.
+   */
+  private void updateFieldsWithHoldingsRecordField(JsonObject jsonData,
+                                                   List<Object> marcRecordFields,
+                                                   boolean suppressedRecordsProcessing) {
+    Map<String, Object> holdingsRecordSubFields = constructHoldingsRecordSubFieldsMap(jsonData);
+    int subFieldValue = calculateDiscoverySuppressedSubfieldValue(jsonData);
+    if (suppressedRecordsProcessing) {
+      holdingsRecordSubFields.put(DISCOVERY_SUPPRESSED_SUBFIELD_CODE, subFieldValue);
+    }
+    if (subFieldValue == 0) {
+      FieldBuilder fieldBuilder = new FieldBuilder();
+      Map<String, Object> holdingsRecordField = fieldBuilder.withFieldTagNumber(HOLDINGS_RECORD_FIELD_TAG_NUMBER)
+        .withFirstIndicator(INDICATOR_VALUE)
+        .withSecondIndicator(INDICATOR_VALUE)
+        .withSubFields(holdingsRecordSubFields)
+        .build();
+      marcRecordFields.add(holdingsRecordField);
+    }
+  }
+
+  private Map<String, Object> constructHoldingsRecordSubFieldsMap(JsonObject holdingsData) {
+    Map<String, Object> holdingsRecordSubFields = new HashMap<>();
+    JsonObject locationGroup = null;
+    if (holdingsData.getJsonObject(LOCATION) != null) {
+      locationGroup = holdingsData.getJsonObject(LOCATION)
+        .getJsonObject(PERMANENT_LOCATION);
+    }
+    JsonObject callNumberGroup = holdingsData.getJsonObject(CALL_NUMBER);
+    JsonArray holdingsStatementsGroup = holdingsData.getJsonArray(HOLDINGS_STATEMENTS);
+
+    addSubFieldGroup(holdingsRecordSubFields, locationGroup, HoldingsRecordSubFields.PERMANENT_LOCATION_NAME);
+    addSubFieldGroup(holdingsRecordSubFields, callNumberGroup, HoldingsRecordSubFields.CALL_NUMBER);
+
+    if (holdingsStatementsGroup != null) {
+      holdingsStatementsGroup.forEach(statementData -> {
+        if (statementData instanceof JsonObject) {
+          addSubFieldGroup(holdingsRecordSubFields, (JsonObject) statementData, HoldingsRecordSubFields.STATEMENT);
+        }
+      });
+    }
+
+    return holdingsRecordSubFields;
+  }
+
+  private void addSubFieldGroup(Map<String, Object> effectiveLocationSubFields, JsonObject holdingsData,
+                                HoldingsRecordSubFields subFieldGroupProperty) {
+    if(holdingsData != null) {
+      String subFieldCode = subFieldGroupProperty.getSubFieldCode();
+      String subFieldValue = holdingsData.getString(subFieldGroupProperty.getJsonPropertyPath());
+      if (isNotEmpty(subFieldValue)) {
+        effectiveLocationSubFields.put(subFieldCode, subFieldValue);
+      }
     }
   }
 
@@ -415,6 +485,27 @@ public class RecordMetadataManager {
     return content.encode();
   }
 
+  private enum HoldingsRecordSubFields {
+    CALL_NUMBER("a", "callNumber"),
+    PERMANENT_LOCATION_NAME("l", "name"),
+    STATEMENT("s", "statement");
+
+    private String subFieldCode;
+    private String jsonPropertyPath;
+
+    HoldingsRecordSubFields(String subFieldCode, String jsonPropertyPath) {
+      this.subFieldCode = subFieldCode;
+      this.jsonPropertyPath = jsonPropertyPath;
+    }
+
+    public String getSubFieldCode() {
+      return subFieldCode;
+    }
+
+    public String getJsonPropertyPath() {
+      return jsonPropertyPath;
+    }
+  }
 
   private Optional<JsonObject> getGeneralInfoDataField(JsonArray fields) {
     return fields.stream()
